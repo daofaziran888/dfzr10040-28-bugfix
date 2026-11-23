@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ from app.models import (
     LineageEdge,
     MergeConflictRule,
     MetricAggrRule,
+    MetricMaterialization,
+    AggregationBasisReceipt,
     PartitionRule,
     QualityGateRule,
     SchemaMapping,
@@ -54,6 +57,8 @@ class FusionEngine:
         self._cold_stores: dict[int, ColdStoreStrategy] = {}
         self._lineages: dict[int, LineageEdge] = {}
         self._metrics: dict[int, MetricAggrRule] = {}
+        self._aggregation_receipts: dict[str, AggregationBasisReceipt] = {}
+        self._materializations: dict[str, MetricMaterialization] = {}
         self._partitions: dict[int, PartitionRule] = {}
         self._watermarks: dict[int, WatermarkRecord] = {}
         self._exports: dict[int, ExportPlan] = {}
@@ -241,21 +246,803 @@ class FusionEngine:
 
     # ---- 5. wide_table_def -> lineage_edge -> metric_aggr ----
 
+    #: 只有这两种状态的血缘边能证明字段关系适用于一次计算。
+    USABLE_LINEAGE_STATUSES = ("已追踪", "已确认")
+
     def create_lineage_edge(self, upstream_node: str, downstream_node: str,
                             related_fields: list[str], transform_function: str = "",
-                            edge_type: str = "direct", dependency_level: int = 1) -> LineageEdge:
+                            edge_type: str = "direct", dependency_level: int = 1,
+                            edge_status: str = "已追踪",
+                            version: int = 1) -> LineageEdge:
+        """建立一条数据血缘边。
+
+        边默认从 v1 的「已追踪」开始。更正边由 publish_correction_edge 生成，
+        初始为「待确认」，在确认前不能用于证明字段关系。
+        """
         sid = self._next_seq()
         edge = LineageEdge(
             edge_id=sid, edge_code=_generate_code("LINE", sid),
             upstream_node=upstream_node, downstream_node=downstream_node,
-            related_fields=related_fields,
+            related_fields=list(related_fields),
             transform_function=transform_function,
             edge_type=edge_type,
             dependency_level=dependency_level,
             last_traced=_now_iso(),
+            version=version,
+            edge_status=edge_status,
         )
         self._lineages[sid] = edge
         return edge
+
+    def _find_lineage_edge(self, edge_ref: int | str) -> LineageEdge | None:
+        """按主键或边编号查找血缘边，兼容接口上传边编号的调用方式。"""
+        if isinstance(edge_ref, str):
+            for edge in self._lineages.values():
+                if edge.edge_code == edge_ref:
+                    return edge
+            try:
+                edge_ref = int(edge_ref)
+            except (TypeError, ValueError):
+                return None
+        return self._lineages.get(int(edge_ref))
+
+    @classmethod
+    def is_lineage_edge_usable(cls, edge: LineageEdge | None) -> bool:
+        """血缘边是否仍可用于证明字段关系（未被撤销、未处于待确认/疑似缺失）。"""
+        return bool(
+            edge is not None
+            and not edge.revoked
+            and edge.edge_status in cls.USABLE_LINEAGE_STATUSES
+        )
+
+    def revoke_lineage_edge(self, edge_ref: int | str, reason: str = "",
+                            superseded_by: str = "") -> dict[str, Any]:
+        """撤销血缘边：撤销后立即失去取数证明力，后续计算与物化读取都不得再采用。"""
+        edge = self._find_lineage_edge(edge_ref)
+        if edge is None:
+            return {"ok": False, "message": f"数据血缘边 {edge_ref} 不存在"}
+        if edge.revoked:
+            return {
+                "ok": True, "already_revoked": True,
+                "edge_code": edge.edge_code, "version": edge.version,
+                "message": "血缘边已处于撤销状态",
+            }
+        edge.revoked = True
+        edge.edge_status = "已废弃"
+        edge.change_reason = reason or edge.change_reason
+        if superseded_by:
+            edge.superseded_by = superseded_by
+        edge.revoked_at = _now_iso()
+        return {
+            "ok": True,
+            "edge_code": edge.edge_code,
+            "version": edge.version,
+            "status": edge.edge_status,
+            "revoked_at": edge.revoked_at,
+            "message": f"血缘边 {edge.edge_code} v{edge.version} 已撤销",
+        }
+
+    def publish_correction_edge(self, original_edge_ref: int | str,
+                                related_fields: list[str] | None = None,
+                                transform_function: str = "",
+                                reason: str = "") -> dict[str, Any]:
+        """发布更正边：继承原边的上下游与版本号 +1，初始为「待确认」。
+
+        更正边在确认前不能替代原边，也不能用于裁定新的计算依据；确认后原边自动撤销。
+        """
+        original = self._find_lineage_edge(original_edge_ref)
+        if original is None:
+            return {"ok": False, "message": f"数据血缘边 {original_edge_ref} 不存在"}
+        correction = self.create_lineage_edge(
+            upstream_node=original.upstream_node,
+            downstream_node=original.downstream_node,
+            related_fields=related_fields if related_fields is not None else original.related_fields,
+            transform_function=transform_function or original.transform_function,
+            edge_type="correction",
+            dependency_level=original.dependency_level,
+            edge_status="待确认",
+            version=original.version + 1,
+        )
+        correction.change_reason = reason
+        correction.supersedes = original.edge_code
+        original.superseded_by = correction.edge_code
+        if reason:
+            original.change_reason = reason
+        return {
+            "ok": True,
+            "edge_code": correction.edge_code,
+            "version": correction.version,
+            "status": correction.edge_status,
+            "fields": list(correction.related_fields),
+            "original_edge_code": original.edge_code,
+            "original_version": original.version,
+            "original_revoked": original.revoked,
+            "message": f"更正边 {correction.edge_code} v{correction.version} 已发布，待确认后生效",
+        }
+
+    def confirm_lineage_edge(self, edge_ref: int | str) -> dict[str, Any]:
+        """确认血缘边；确认更正边时，被它替代的旧边同步撤销。"""
+        edge = self._find_lineage_edge(edge_ref)
+        if edge is None:
+            return {"ok": False, "message": f"数据血缘边 {edge_ref} 不存在"}
+        if edge.revoked:
+            return {"ok": False, "message": f"血缘边 {edge.edge_code} 已撤销，不能确认"}
+        edge.edge_status = "已确认"
+        edge.last_traced = _now_iso()
+        superseded: list[str] = []
+        for other in self._lineages.values():
+            if (other.edge_id != edge.edge_id
+                    and other.superseded_by == edge.edge_code):
+                if not other.revoked:
+                    self.revoke_lineage_edge(
+                        other.edge_id,
+                        reason=f"被更正边 {edge.edge_code} v{edge.version} 替代",
+                        superseded_by=edge.edge_code,
+                    )
+                superseded.append(other.edge_code)
+        return {
+            "ok": True,
+            "edge_code": edge.edge_code,
+            "version": edge.version,
+            "status": edge.edge_status,
+            "superseded_edges": superseded,
+            "message": f"血缘边 {edge.edge_code} v{edge.version} 已确认",
+        }
+
+    def _resolve_lineage_coverage(
+        self,
+        target_wide_table: str,
+        fields: list[str],
+        preferred_edge: LineageEdge,
+        implicitly_allowed: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """核对目标表归属与逐字段取数权限。
+
+        只有本次传入的血缘边能证明字段关系：边下游节点必须等于目标表，字段必须
+        出现在该边的关联字段里。不会借用同表其他边的权限，避免跨边提权；字段
+        未覆盖时区分「边归属错误」「根本没有边覆盖」「边已撤销」「更正边待确认」。
+        """
+        implicitly_allowed = implicitly_allowed or set()
+        ownership_ok = preferred_edge.downstream_node == target_wide_table
+        field_permissions: dict[str, dict[str, Any]] = {}
+        denied: dict[str, str] = {}
+
+        for field in fields:
+            if field in implicitly_allowed:
+                field_permissions[field] = {
+                    "read": True, "edge_code": "", "edge_version": 0,
+                    "source": "target_table_partition_key",
+                }
+                continue
+
+            if field in preferred_edge.related_fields:
+                field_permissions[field] = {
+                    "read": True,
+                    "edge_code": preferred_edge.edge_code,
+                    "edge_version": preferred_edge.version,
+                    "edge_status": preferred_edge.edge_status,
+                    "source": f"{preferred_edge.edge_code}@v{preferred_edge.version}",
+                }
+                continue
+
+            related = [
+                edge for edge in self._lineages.values()
+                if edge.downstream_node == target_wide_table
+                and field in edge.related_fields
+            ]
+            if any(edge.revoked for edge in related):
+                denied[field] = f"字段 {field} 的血缘边已被撤销，当前没有可证明适用的字段关系"
+            elif related:
+                denied[field] = (
+                    f"血缘边 {preferred_edge.edge_code} v{preferred_edge.version} 未覆盖字段 "
+                    f"{field}，不能借用其他血缘边，本次无读取权限"
+                )
+            elif not ownership_ok:
+                denied[field] = (
+                    f"血缘边 {preferred_edge.edge_code} 的归属表是 "
+                    f"{preferred_edge.downstream_node}，与目标表 {target_wide_table} 无关"
+                )
+            else:
+                denied[field] = (
+                    f"血缘边 {preferred_edge.edge_code} v{preferred_edge.version} 未覆盖字段 "
+                    f"{field}，目标表 {target_wide_table} 无读取权限"
+                )
+
+        return {
+            "ownership_ok": ownership_ok,
+            "field_permissions": field_permissions,
+            "denied_fields": denied,
+        }
+
+    def _aggregation_permissions(self, target_wide_table: str,
+                                 field_permissions: dict[str, dict[str, Any]],
+                                 primary_edge: LineageEdge,
+                                 measure_field: str | None,
+                                 group_dimensions: list[str]) -> dict[str, Any]:
+        """聚合依据回执中的表/字段取数权限说明。"""
+        fields: dict[str, dict[str, Any]] = {}
+        adopted: dict[str, dict[str, Any]] = {}
+        for field, permission in field_permissions.items():
+            role = "measure" if field == measure_field else "group"
+            fields[field] = {**permission, "role": role}
+            if permission.get("edge_code"):
+                key = f"{permission['edge_code']}@v{permission['edge_version']}"
+                adopted.setdefault(key, {
+                    "edge_code": permission["edge_code"],
+                    "version": permission["edge_version"],
+                    "fields": [],
+                })
+                adopted[key]["fields"].append(field)
+
+        for item in adopted.values():
+            edge = self._find_lineage_edge(item["edge_code"])
+            if edge is not None:
+                item["upstream_node"] = edge.upstream_node
+                item["downstream_node"] = edge.downstream_node
+                item["status"] = edge.edge_status
+                item["related_fields"] = list(edge.related_fields)
+
+        return {
+            "target_table": target_wide_table,
+            "table": {
+                "name": target_wide_table,
+                "read": True,
+                "owned_by_edge": primary_edge.edge_code,
+                "downstream_node": primary_edge.downstream_node,
+            },
+            "fields": fields,
+            "field_permissions": fields,
+            "allowed_fields": sorted(fields),
+            "measure_field": measure_field,
+            "group_dimensions": list(group_dimensions),
+            "adopted_edges": sorted(
+                adopted.values(),
+                key=lambda item: (item["edge_code"], item["version"]),
+            ),
+        }
+
+    def _rows_for_target_table(self, target_wide_table: str) -> list[dict[str, Any]]:
+        job = self._find_fusion_job_by_table(target_wide_table)
+        if job is None:
+            return []
+        return list(job.merged_records)
+
+    @staticmethod
+    def _is_missing_value(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == "" or value.strip().upper() in {"NULL", "NONE"}
+        return False
+
+    @staticmethod
+    def _numeric_value(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _materialize_from_receipt(
+        self,
+        receipt: AggregationBasisReceipt,
+    ) -> MetricMaterialization:
+        """按聚合依据回执读取真实输入范围并物化分组明细。
+
+        只读取回执授权的字段；分组键缺失的行不会进入任何分组，也不会有空键分组
+        被当作合法分组展示。
+        """
+        rows = self._rows_for_target_table(receipt.target_wide_table)
+        allowed_fields = set(receipt.permissions.get("allowed_fields", []))
+        group_dimensions = list(receipt.group_dimensions)
+        measure_field = receipt.measure_field
+
+        groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+        ordered_values: dict[tuple[Any, ...], list[Any]] = {}
+        skipped_missing_key = 0
+        skipped_missing_measure = 0
+        skipped_unpermitted = 0
+        rows_used = 0
+
+        required_read_fields = set(group_dimensions)
+        if measure_field is not None:
+            required_read_fields.add(measure_field)
+        if not required_read_fields <= allowed_fields:
+            # 回执没有授权全部分组/度量字段时不做任何取数。
+            skipped_unpermitted = len(rows)
+            rows = []
+
+        for row in rows:
+            # 输入范围只取回执授权的字段；未授权字段不会被读取。
+            projected = {
+                field: row.get(field)
+                for field in allowed_fields
+                if field in row
+            }
+            if any(self._is_missing_value(projected.get(field))
+                   for field in group_dimensions):
+                skipped_missing_key += 1
+                continue
+
+            key = tuple(str(projected.get(field)).strip() for field in group_dimensions)
+            rows_used += 1
+            group = groups.get(key)
+            if group is None:
+                group = {
+                    "group": {
+                        field: projected.get(field) for field in group_dimensions
+                    },
+                    "group_key": ",".join(
+                        f"{field}={projected.get(field)}"
+                        for field in group_dimensions
+                    ),
+                    "rows": 0,
+                    "group_fields": list(group_dimensions),
+                    "source_fields": {
+                        field: receipt.permissions["fields"][field]["source"]
+                        for field in group_dimensions
+                    },
+                }
+                groups[key] = group
+                ordered_values[key] = []
+            group["rows"] += 1
+
+            if measure_field is None:
+                continue
+            measure_raw = projected.get(measure_field)
+            if self._is_missing_value(measure_raw):
+                group["rows_missing_measure"] = group.get("rows_missing_measure", 0) + 1
+                skipped_missing_measure += 1
+                continue
+            numeric = self._numeric_value(measure_raw)
+            if numeric is None:
+                if receipt.agg_function.upper() == "COUNT_DISTINCT":
+                    ordered_values[key].append(measure_raw)
+                else:
+                    group["rows_missing_measure"] = group.get("rows_missing_measure", 0) + 1
+                    skipped_missing_measure += 1
+                continue
+            ordered_values[key].append(numeric)
+
+        for key, group in groups.items():
+            values = ordered_values.get(key, [])
+            group["measure"] = self._aggregate_values(receipt.agg_function, values)
+            if receipt.agg_function.upper() == "COUNT" and receipt.measure_field is None:
+                group["measure"] = group["rows"]
+            group["adopted_edges"] = list(receipt.adopted_edge_versions)
+
+        input_range = {
+            "target_table": receipt.target_wide_table,
+            "source_nodes": sorted({
+                item.get("upstream_node", "")
+                for item in receipt.adopted_edge_versions
+                if item.get("upstream_node")
+            }),
+            "read_fields": sorted(allowed_fields),
+            "field_sources": {
+                field: receipt.permissions["fields"][field]["source"]
+                for field in receipt.permissions["fields"]
+            },
+            "rows_scanned": len(rows),
+            "rows_used": rows_used,
+            "rows_skipped_missing_key": skipped_missing_key,
+            "rows_skipped_missing_measure": skipped_missing_measure,
+            "rows_skipped_unpermitted": skipped_unpermitted,
+        }
+
+        materialization = MetricMaterialization(
+            materialization_code=f"MATL-{len(self._materializations) + 1:04d}",
+            receipt_code=receipt.receipt_code,
+            metric_rule_code=receipt.metric_rule_code,
+            target_wide_table=receipt.target_wide_table,
+            agg_function=receipt.agg_function,
+            measure_field=receipt.measure_field,
+            group_dimensions=list(receipt.group_dimensions),
+            groups=list(groups.values()),
+            skipped_missing_key=skipped_missing_key,
+            skipped_unpermitted=skipped_unpermitted,
+            adopted_edge_versions=copy.deepcopy(receipt.adopted_edge_versions),
+            input_range=input_range,
+            created_at=_now_iso(),
+        )
+        self._materializations[materialization.materialization_code] = materialization
+        return materialization
+
+    @staticmethod
+    def _aggregate_values(agg_function: str, values: list[Any]) -> Any:
+        function = (agg_function or "").upper()
+        if function == "COUNT":
+            return len(values)
+        numeric = [value for value in values if isinstance(value, (int, float))]
+        if function == "COUNT_DISTINCT":
+            return len(set(values))
+        if not numeric:
+            return None
+        if function == "AVG":
+            return sum(numeric) / len(numeric)
+        if function == "MAX":
+            return max(numeric)
+        if function == "MIN":
+            return min(numeric)
+        return sum(numeric)
+
+    @staticmethod
+    def _normalize_dimensions(dimensions: list[str] | str | None) -> list[str]:
+        """分组维度兼容列表、逗号分隔字符串和空值，去重后保持原顺序。"""
+        if dimensions is None:
+            return []
+        if isinstance(dimensions, str):
+            items = dimensions.replace("，", ",").split(",")
+        else:
+            items = list(dimensions)
+        normalized = [str(item).strip() for item in items if str(item).strip()]
+        return list(dict.fromkeys(normalized))
+
+    def compute_metric_from_lineage(
+        self,
+        lineage_edge_id: int | str,
+        target_wide_table: str,
+        agg_function: str,
+        group_dimensions: list[str],
+        measure_field: str | None = None,
+        *,
+        materialize: bool = True,
+    ) -> dict[str, Any]:
+        """基于数据血缘边计算指标聚合规则，并生成聚合依据回执与物化记录。
+
+        取数前先核对边对目标表的归属与逐字段权限：
+        - 边下游节点不是目标表时立即拒绝，且不创建规则/回执/物化；
+        - 分组或度量字段没有被任何可用血缘边覆盖时拒绝，不读取表数据。
+        只有核对通过才会冻结回执，回执记录实际采用的血缘边编号与版本。
+        """
+        edge = self._find_lineage_edge(lineage_edge_id)
+        if edge is None:
+            return {"ok": False, "message": f"数据血缘边 {lineage_edge_id} 不存在"}
+
+        if edge.downstream_node != target_wide_table:
+            return {
+                "ok": False,
+                "unauthorized": True,
+                "message": (
+                    f"越权取数：血缘边 {edge.edge_code} 归属表为 "
+                    f"{edge.downstream_node}，不能为目标表 {target_wide_table} 计算指标"
+                ),
+                "lineage_edge": {
+                    "edge_code": edge.edge_code,
+                    "version": edge.version,
+                    "upstream_node": edge.upstream_node,
+                    "downstream_node": edge.downstream_node,
+                },
+                "target_table": target_wide_table,
+            }
+
+        if not self.is_lineage_edge_usable(edge):
+            if edge.revoked:
+                reason = f"血缘边 {edge.edge_code} v{edge.version} 已撤销，不能作为本次计算依据"
+            else:
+                reason = (
+                    f"血缘边 {edge.edge_code} v{edge.version} 状态为「{edge.edge_status}」，"
+                    "不能证明字段关系适用于本次计算"
+                )
+            return {
+                "ok": False,
+                "basis_rejected": True,
+                "message": reason,
+                "lineage_edge": {
+                    "edge_code": edge.edge_code,
+                    "version": edge.version,
+                    "status": edge.edge_status,
+                },
+                "target_table": target_wide_table,
+            }
+
+        group_dimensions = self._normalize_dimensions(group_dimensions)
+        agg_function = str(agg_function or "").strip().upper()
+
+        wide_table = next(
+            (table for table in self._wide_tables.values()
+             if table.table_name == target_wide_table),
+            None,
+        )
+        # 宽表自身登记的分区键属于目标表元数据，不依赖血缘边授权；
+        # 其余字段一律需要可用血缘边覆盖。
+        implicitly_allowed = {wide_table.partition_key} if wide_table else set()
+
+        if measure_field is None and (agg_function or "").upper() != "COUNT":
+            for field in edge.related_fields:
+                if field not in group_dimensions:
+                    measure_field = field
+                    break
+
+        required_fields = list(group_dimensions)
+        if measure_field is not None:
+            required_fields.append(measure_field)
+        required_fields = list(dict.fromkeys(required_fields))
+
+        coverage = self._resolve_lineage_coverage(
+            target_wide_table, required_fields, edge, implicitly_allowed)
+        if coverage["denied_fields"]:
+            return {
+                "ok": False,
+                "unauthorized": True,
+                "message": "拒绝越权聚合：" + "；".join(coverage["denied_fields"].values()),
+                "denied_fields": coverage["denied_fields"],
+                "target_table": target_wide_table,
+                "lineage_edge": {
+                    "edge_code": edge.edge_code,
+                    "version": edge.version,
+                    "downstream_node": edge.downstream_node,
+                    "related_fields": list(edge.related_fields),
+                },
+                "permissions": {
+                    "target_table": target_wide_table,
+                    "fields": coverage["field_permissions"],
+                    "denied_fields": coverage["denied_fields"],
+                },
+            }
+
+        rule = self.create_metric_aggr_rule(
+            target_wide_table=target_wide_table,
+            agg_function=agg_function,
+            group_dimensions=group_dimensions,
+        )
+        rule.last_computed = _now_iso()
+
+        permissions = self._aggregation_permissions(
+            target_wide_table, coverage["field_permissions"], edge,
+            measure_field, group_dimensions,
+        )
+        receipt_code = f"RCPT-{len(self._aggregation_receipts) + 1:04d}"
+        receipt = AggregationBasisReceipt(
+            receipt_code=receipt_code,
+            metric_rule_code=rule.rule_code,
+            target_wide_table=target_wide_table,
+            agg_function=agg_function,
+            measure_field=measure_field,
+            group_dimensions=list(group_dimensions),
+            permissions=copy.deepcopy(permissions),
+            input_range={},
+            adopted_edge_versions=copy.deepcopy(permissions["adopted_edges"]),
+            created_at=_now_iso(),
+        )
+        self._aggregation_receipts[receipt_code] = receipt
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "metric_rule_code": rule.rule_code,
+            "from_lineage": edge.edge_code,
+            "lineage_edge_version": edge.version,
+            "agg_function": agg_function,
+            "group_dimensions": group_dimensions,
+            "measure_field": measure_field,
+            "receipt_code": receipt_code,
+            "basis_receipt": receipt_code,
+            "receipt": {
+                "receipt_code": receipt_code,
+                "metric_rule_code": rule.rule_code,
+                "target_wide_table": target_wide_table,
+                "permissions": copy.deepcopy(permissions),
+                "adopted_edge_versions": copy.deepcopy(receipt.adopted_edge_versions),
+                "created_at": receipt.created_at,
+            },
+            "adopted_edge_versions": copy.deepcopy(receipt.adopted_edge_versions),
+            "permissions": copy.deepcopy(permissions),
+        }
+
+        if materialize:
+            materialization = self._materialize_from_receipt(receipt)
+            receipt.input_range = copy.deepcopy(materialization.input_range)
+            receipt.input_range["read_permissions"] = copy.deepcopy(
+                receipt.permissions.get("fields", {}))
+            result["materialization_code"] = materialization.materialization_code
+            result["input_range"] = copy.deepcopy(receipt.input_range)
+            result["groups"] = copy.deepcopy(materialization.groups)
+            result["skipped_missing_key"] = materialization.skipped_missing_key
+            result["materialization"] = {
+                "materialization_code": materialization.materialization_code,
+                "receipt_code": materialization.receipt_code,
+                "basis_receipt": receipt.receipt_code,
+                "metric_rule_code": materialization.metric_rule_code,
+                "target_wide_table": materialization.target_wide_table,
+                "agg_function": materialization.agg_function,
+                "measure_field": materialization.measure_field,
+                "group_dimensions": list(materialization.group_dimensions),
+                "groups": copy.deepcopy(materialization.groups),
+                "skipped_missing_key": materialization.skipped_missing_key,
+                "skipped_unpermitted": materialization.skipped_unpermitted,
+                "adopted_edge_versions": copy.deepcopy(materialization.adopted_edge_versions),
+                "input_range": copy.deepcopy(receipt.input_range),
+                "created_at": materialization.created_at,
+            }
+
+        return result
+
+    def get_aggregation_receipt(self, receipt_ref: str) -> dict[str, Any] | None:
+        receipt = self._aggregation_receipts.get(receipt_ref)
+        if receipt is None:
+            return None
+        return {
+            "receipt_code": receipt.receipt_code,
+            "metric_rule_code": receipt.metric_rule_code,
+            "target_wide_table": receipt.target_wide_table,
+            "agg_function": receipt.agg_function,
+            "measure_field": receipt.measure_field,
+            "group_dimensions": list(receipt.group_dimensions),
+            "permissions": copy.deepcopy(receipt.permissions),
+            "input_range": copy.deepcopy(receipt.input_range),
+            "adopted_edge_versions": copy.deepcopy(receipt.adopted_edge_versions),
+            "created_at": receipt.created_at,
+        }
+
+    def _find_materialization(self, ref: str) -> MetricMaterialization | None:
+        if ref in self._materializations:
+            return self._materializations[ref]
+        for materialization in reversed(list(self._materializations.values())):
+            if materialization.metric_rule_code == ref:
+                return materialization
+        for materialization in reversed(list(self._materializations.values())):
+            if materialization.receipt_code == ref:
+                return materialization
+        return None
+
+    def _check_materialization_basis(
+        self, materialization: MetricMaterialization,
+    ) -> list[dict[str, Any]]:
+        """核对物化采用的每条血缘边版本是否仍能证明适用于该次计算。"""
+        stale: list[dict[str, Any]] = []
+        for adopted in materialization.adopted_edge_versions:
+            edge = self._find_lineage_edge(adopted.get("edge_code", ""))
+            fields = list(adopted.get("fields", []))
+            detail = {
+                "edge_code": adopted.get("edge_code"),
+                "adopted_version": adopted.get("version"),
+                "fields": fields,
+            }
+            if edge is None:
+                detail.update({"current_version": None, "reason": "血缘边已不存在"})
+                stale.append(detail)
+                continue
+            detail["current_version"] = edge.version
+            detail["current_status"] = edge.edge_status
+            if edge.revoked:
+                detail["reason"] = "采用的血缘边已被撤销"
+            elif edge.edge_status not in self.USABLE_LINEAGE_STATUSES:
+                detail["reason"] = f"采用的血缘边当前状态为「{edge.edge_status}」"
+            elif edge.version != adopted.get("version"):
+                detail["reason"] = (
+                    f"采用的版本 v{adopted.get('version')} 与当前 v{edge.version} 不一致"
+                )
+            elif any(field not in edge.related_fields for field in fields):
+                detail["reason"] = "当前边的字段覆盖范围已变化"
+            else:
+                continue
+            stale.append(detail)
+        return stale
+
+    def _pending_corrections(self, materialization: MetricMaterialization) -> list[dict[str, Any]]:
+        """列出与该次物化采用的老边相关、但尚未确认的更正边。"""
+        pending: list[dict[str, Any]] = []
+        for adopted in materialization.adopted_edge_versions:
+            edge = self._find_lineage_edge(adopted.get("edge_code", ""))
+            if edge is None:
+                continue
+            corrections = [
+                other for other in self._lineages.values()
+                if other.supersedes == edge.edge_code
+                or other.edge_code == edge.superseded_by
+            ]
+            for correction in corrections:
+                pending.append({
+                    "edge_code": correction.edge_code,
+                    "version": correction.version,
+                    "status": correction.edge_status,
+                    "usable": self.is_lineage_edge_usable(correction),
+                    "fields": list(correction.related_fields),
+                })
+        return pending
+
+    def read_materialization(self, materialization_ref: str,
+                             allow_stale: bool = False) -> dict[str, Any]:
+        """读取物化详情，并核对本次物化实际采用的血缘版本。
+
+        回执在受理时冻结，之后的撤销/更正不会改写历史记录；一旦采用的血缘边
+        已撤销、被替代或字段范围变化，默认拒绝把这份物化当作当前有效依据，
+        同时在输出中保留采用版本与失效原因供核对。
+        """
+        materialization = self._find_materialization(materialization_ref)
+        if materialization is None:
+            return {"ok": False, "message": f"物化记录 {materialization_ref} 不存在"}
+
+        stale = self._check_materialization_basis(materialization)
+        base: dict[str, Any] = {
+            "materialization_code": materialization.materialization_code,
+            "receipt_code": materialization.receipt_code,
+            "basis_receipt": materialization.receipt_code,
+            "metric_rule_code": materialization.metric_rule_code,
+            "target_wide_table": materialization.target_wide_table,
+            "agg_function": materialization.agg_function,
+            "measure_field": materialization.measure_field,
+            "group_dimensions": list(materialization.group_dimensions),
+            "adopted_edge_versions": copy.deepcopy(materialization.adopted_edge_versions),
+            "input_range": copy.deepcopy(materialization.input_range),
+            "group_count": len(materialization.groups),
+            "skipped_missing_key": materialization.skipped_missing_key,
+            "skipped_unpermitted": materialization.skipped_unpermitted,
+            "created_at": materialization.created_at,
+            "basis_valid": not stale,
+        }
+
+        if stale:
+            base.update({
+                "ok": False,
+                "status": "依据已失效",
+                "message": (
+                    "本次物化采用的血缘关系已不能证明适用于该次计算："
+                    + "；".join(
+                        f"{item['edge_code']} v{item['adopted_version']} {item['reason']}"
+                        for item in stale
+                    )
+                ),
+                "rejection_basis": "本次物化采用的血缘边已撤销或被更正，"
+                                   "且更正边未参与该次计算，不能据此继续取数；请确认新边后重算",
+                "stale_edges": stale,
+                "basis_frozen": True,
+                "requires_recompute": True,
+                "historical_groups": copy.deepcopy(materialization.groups),
+                "pending_corrections": self._pending_corrections(materialization),
+            })
+            if allow_stale:
+                base["groups"] = copy.deepcopy(materialization.groups)
+            return base
+
+        base["pending_corrections"] = self._pending_corrections(materialization)
+
+        base.update({
+            "ok": True,
+            "status": "依据有效",
+            "groups": copy.deepcopy(materialization.groups),
+            "materialization": {
+                "materialization_code": materialization.materialization_code,
+                "receipt_code": materialization.receipt_code,
+                "metric_rule_code": materialization.metric_rule_code,
+                "target_wide_table": materialization.target_wide_table,
+                "agg_function": materialization.agg_function,
+                "measure_field": materialization.measure_field,
+                "group_dimensions": list(materialization.group_dimensions),
+                "groups": copy.deepcopy(materialization.groups),
+                "skipped_missing_key": materialization.skipped_missing_key,
+                "skipped_unpermitted": materialization.skipped_unpermitted,
+                "adopted_edge_versions": copy.deepcopy(materialization.adopted_edge_versions),
+                "input_range": copy.deepcopy(materialization.input_range),
+                "created_at": materialization.created_at,
+            },
+        })
+        return base
+
+    # 兼容按「物化/聚合详情」语义调用的入口。
+    get_materialization = read_materialization
+
+    def list_materializations(self, metric_rule_code: str | None = None,
+                              target_wide_table: str | None = None) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for materialization in self._materializations.values():
+            if metric_rule_code and materialization.metric_rule_code != metric_rule_code:
+                continue
+            if target_wide_table and materialization.target_wide_table != target_wide_table:
+                continue
+            items.append({
+                "materialization_code": materialization.materialization_code,
+                "receipt_code": materialization.receipt_code,
+                "metric_rule_code": materialization.metric_rule_code,
+                "target_wide_table": materialization.target_wide_table,
+                "adopted_edge_versions": copy.deepcopy(materialization.adopted_edge_versions),
+                "group_count": len(materialization.groups),
+                "created_at": materialization.created_at,
+            })
+        return items
 
     def create_metric_aggr_rule(self, target_wide_table: str, agg_function: str,
                                 group_dimensions: list[str], time_granularity: str = "1d",
@@ -266,7 +1053,7 @@ class FusionEngine:
             rule_id=sid, rule_code=_generate_code("METR", sid),
             target_wide_table=target_wide_table,
             agg_function=agg_function,
-            group_dimensions=group_dimensions,
+            group_dimensions=list(group_dimensions),
             time_granularity=time_granularity,
             precompute_window=precompute_window,
             storage_table=storage_table or f"aggr_{target_wide_table}",
@@ -719,30 +1506,6 @@ class FusionEngine:
             "last_updated": wt.last_updated,
         }
 
-    def compute_metric_from_lineage(self, lineage_edge_id: int,
-                                    target_wide_table: str,
-                                    agg_function: str,
-                                    group_dimensions: list[str]) -> dict[str, Any]:
-        """基于数据血缘边计算指标聚合规则。"""
-        edge = self._lineages.get(lineage_edge_id)
-        if edge is None:
-            return {"ok": False, "message": f"数据血缘边 {lineage_edge_id} 不存在"}
-
-        rule = self.create_metric_aggr_rule(
-            target_wide_table=target_wide_table,
-            agg_function=agg_function,
-            group_dimensions=group_dimensions,
-        )
-        rule.last_computed = _now_iso()
-
-        return {
-            "ok": True,
-            "metric_rule_code": rule.rule_code,
-            "from_lineage": edge.edge_code,
-            "agg_function": agg_function,
-            "group_dimensions": group_dimensions,
-        }
-
     # ---- 辅助方法 ----
 
     def _find_source_by_code(self, source_code: str) -> SourceDef | None:
@@ -867,7 +1630,14 @@ class FusionEngine:
             "backfills": len(self._backfills),
             "cold_stores": len(self._cold_stores),
             "lineages": len(self._lineages),
+            "usable_lineages": sum(
+                1 for edge in self._lineages.values()
+                if self.is_lineage_edge_usable(edge)
+            ),
+            "revoked_lineages": sum(1 for edge in self._lineages.values() if edge.revoked),
             "metrics": len(self._metrics),
+            "aggregation_receipts": len(self._aggregation_receipts),
+            "materializations": len(self._materializations),
             "partitions": len(self._partitions),
             "watermarks": len(self._watermarks),
             "exports": len(self._exports),

@@ -35,6 +35,9 @@ def overview() -> dict[str, object]:
 
 
 # 资源路由含 /api/{module}，必须放在 health / overview 之后注册，
-# 否则固定路径会被动态路径抢先匹配。
+# 否则固定路径会被动态路径抢先匹配；指标聚合/血缘专用入口排在通用资源路由之前。
 for module in ROUTERS:
     app.include_router(module.router)
+    lineage_router = getattr(module, "lineage_router", None)
+    if lineage_router is not None:
+        app.include_router(lineage_router)

@@ -242,7 +242,11 @@ class ColdStoreStrategy:
 
 @dataclass
 class LineageEdge:
-    """数据血缘边：宽表字段与源表字段之间的血缘追踪。"""
+    """数据血缘边：宽表字段与源表字段之间的血缘追踪。
+
+    每条边都带有版本号和状态：撤销（已废弃）、被更正边替代、待确认的更正边
+    都不能再用于新的指标计算，只有「已追踪」「已确认」的边能证明字段关系适用。
+    """
     edge_id: int
     edge_code: str
     upstream_node: str
@@ -252,6 +256,23 @@ class LineageEdge:
     edge_type: str
     dependency_level: int
     last_traced: str
+    version: int = 1
+    edge_status: str = "已追踪"
+    revoked: bool = False
+    superseded_by: str = ""
+    supersedes: str = ""
+    change_reason: str = ""
+    revoked_at: str = ""
+
+    @property
+    def status(self) -> str:
+        """状态别名：与模块通用状态字段保持一致，便于跨模块读取。"""
+        return self.edge_status
+
+    @property
+    def usable(self) -> bool:
+        """未被撤销且状态可确认时，这条边才能证明字段关系适用于一次计算。"""
+        return not self.revoked and self.edge_status in ("已追踪", "已确认")
 
 
 @dataclass
@@ -266,6 +287,43 @@ class MetricAggrRule:
     precompute_window: str
     storage_table: str
     last_computed: str = ""
+
+
+@dataclass
+class AggregationBasisReceipt:
+    """聚合依据回执：明确本次计算可读取的表、来源节点、字段和采用的血缘版本。
+
+    回执在计算受理时冻结，之后的血缘撤销/更正不会改写回执内容，只会在读取时
+    被核对并标记失效，避免值班读到半新半旧的字段关系。
+    """
+    receipt_code: str
+    metric_rule_code: str
+    target_wide_table: str
+    agg_function: str
+    measure_field: str
+    group_dimensions: list[str]
+    permissions: dict[str, Any]
+    input_range: dict[str, Any]
+    adopted_edge_versions: list[dict[str, Any]]
+    created_at: str
+
+
+@dataclass
+class MetricMaterialization:
+    """指标物化记录：按聚合依据回执建立的真实输入范围和分组明细。"""
+    materialization_code: str
+    receipt_code: str
+    metric_rule_code: str
+    target_wide_table: str
+    agg_function: str
+    measure_field: str
+    group_dimensions: list[str]
+    groups: list[dict[str, Any]]
+    skipped_missing_key: int
+    skipped_unpermitted: int
+    adopted_edge_versions: list[dict[str, Any]]
+    input_range: dict[str, Any]
+    created_at: str
 
 
 @dataclass
